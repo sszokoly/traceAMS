@@ -12,7 +12,7 @@ Many Avaya applications come with a command line tool which provides a consolida
 
 ## Solution
 
-This tool is aiming to address the aforementioned shortcoming by:
+This tool is aiming at addressing the aforementioned shortcoming in AMS by:
 
 - enabling SIP debug logging from Linux shell
 - parsing and retaining 10000 SIP messages in memory
