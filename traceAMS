@@ -1,0 +1,2878 @@
+#!/usr/bin/env python
+# -*- encoding: utf-8 -*-
+"""
+#############################################################################
+## Name: traceAMS
+## This tool monitors SIP messages and calls in Avaya Media Server.
+## Date: 2020-12-26
+## Author: sszokoly@protonmail.com
+#############################################################################
+"""
+from __future__ import print_function
+import curses
+import curses.textpad
+import fcntl
+import locale
+import logging
+import os
+import re
+import resource
+import shlex
+import sys
+import xml.etree.cElementTree as ET
+from base64 import b64decode
+from collections import OrderedDict, defaultdict
+from datetime import datetime, timedelta
+from functools import wraps
+from itertools import izip, izip_longest, islice
+from optparse import Option, OptionParser, SUPPRESS_HELP
+from optparse import BadOptionError, AmbiguousOptionError
+from platform import node
+from subprocess import Popen, PIPE
+from textwrap import wrap
+
+
+############################################################################
+#                                 Globals                                  #
+############################################################################
+
+
+HELP = """
+This tool displays SIP messages and active sessions in Avaya Media Server.  
+Version: {0}
+"""
+MAXLEN = 20000                   # max noof SIP msgs retained in memory
+MIN_ACTiVE_SESS_UPDATE_SECS = 2  # min noof secs between active sess updates
+
+TERM = os.environ["TERM"]
+LOCALE = locale.getlocale()
+DEBUG_LOG = "traceAMS.log"
+VERSION = 0.1
+
+
+##############################################################################
+#                                   MODULES                                  #
+##############################################################################
+
+##############################################################################
+#                                   xmlparser                                #
+##############################################################################
+
+
+def parse_xml(xmlstr):
+    """Converts XML to dictionary recursively using ET.
+
+    Args:
+        xmlstr (str): XML content.
+
+    Returns:
+        dict: XML content in dictionary.
+    """
+    try:
+        tree = ET.ElementTree(ET.fromstring(xmlstr.strip()))
+    except:
+        # This is to work around the XML syntax error in dialogstart msml.
+        m = re.search(r'version="1.1">\n\s+<(\w+) (.*)>\n', xmlstr.strip())
+        try:
+            return {"msml": {m.group(1): dict(
+                a.replace('"', '').split("=") for a in m.group(2).split()
+            )}}
+        except:
+            return {"msml": {}}
+
+    root = tree.getroot()
+
+    def etree_to_dict(t):
+        d = {t.tag: {} if t.attrib else None}
+        children = list(t)
+        if children:
+            dd = defaultdict(list)
+            for dc in map(etree_to_dict, children):
+                for k, v in dc.items():
+                    dd[k].append(v)
+            ddd = {}
+            for k, v in dd.iteritems():
+                if len(v) == 1:
+                    ddd[k] = v[0]
+                else:
+                    ddd[k] = v
+            d = {t.tag: ddd}
+        if t.attrib:
+            d[t.tag].update((k, v) for k, v in t.attrib.items())
+        if t.text:
+            text = t.text.strip()
+            if children or t.attrib:
+                if text:
+                    d[t.tag]["#text"] = text
+            else:
+                d[t.tag] = text
+        return d
+
+    return etree_to_dict(root)
+
+
+##############################################################################
+#                                 filterparser                               #
+##############################################################################
+
+
+class SilentOptionParser(OptionParser):
+    """An unknown option pass-through implementation of OptionParser.
+
+    Note:
+        When unknown arguments are encountered, bundle with largs
+        and try again, until rargs is depleted.
+    """
+    def error(self, msg):
+        pass
+
+    def _process_args(self, largs, rargs, values):
+        while rargs:
+            try:
+                OptionParser._process_args(self, largs, rargs, values)
+            except (BadOptionError, AmbiguousOptionError), e:
+                largs.append(e.opt_str)
+
+
+class MultipleOption(Option):
+    """An extend option value implementation of Option."""
+    ACTIONS = Option.ACTIONS + ("extend",)
+    STORE_ACTIONS = Option.STORE_ACTIONS + ("extend",)
+    TYPED_ACTIONS = Option.TYPED_ACTIONS + ("extend",)
+    ALWAYS_TYPED_ACTIONS = Option.ALWAYS_TYPED_ACTIONS + ("extend",)
+
+    def take_action(self, action, dest, opt, value, values, parser):
+        if action == "extend":
+            values.ensure_value(dest, []).append(value)
+        else:
+            Option.take_action(self, action, dest, opt, value, values, parser)
+
+
+def parse_filter(argstr):
+    """Returns display filter string as dict.
+
+    Note: it is very simple, forgiving and does not handle corner cases.
+
+    Args:
+        argstr (str): arguments, for example "-nn -no -c 10.1.1.".
+
+    Returns:
+        dict: dictionary of args.
+    """
+    def split_on_pipe(option, opt_str, value, parser):
+        """Splits option on | and extends list of values."""
+        parser.values.ensure_value(option.dest, []).extend(
+            [re.sub(r"[\"\']", "", x) for x in value.split("|")])
+
+    def singlechar(option, opt_str, value, parser):
+        """Appends first char of value to option list."""
+        parser.values.ensure_value(option.dest, []).append(value[0])
+
+    argstr = argstr.replace("'", '"')
+    if argstr.count('"') % 2:
+        return {}, ["Unbalanced quotes!"]
+
+    args = re.split(r''' (?=(?:[^'"]|'[^']*'|"[^"]*")*$)''', argstr)
+    parser = SilentOptionParser(option_class=MultipleOption)
+    for argname in ("-a", "-c", "-i", "-r"):
+        dest = str(argname.strip("-"))
+        parser.add_option(argname, action="callback", callback=split_on_pipe,
+                          dest=dest, type="string")
+    parser.add_option("-n", action="callback", callback=singlechar,
+                      dest="n", type="string")
+    try:
+        opts, args = parser.parse_args(args)
+        return vars(opts), " ".join(parser.largs)
+    except Exception as e:
+        return {}, "Exception: {0}".format(e)
+
+
+##############################################################################
+#                                     ams                                    #
+##############################################################################
+
+
+class SIPLogReader(object):
+    """Parses sip.txt trace files of Avaya AMS server.
+
+    Raises:
+        StopIteration: when logfiles is provided and all logfiles are parsed.
+    """
+    LOGDIR = "/opt/avaya/app/amsinst/ma/MAS/common/log"
+    LOGFILENAME = "sip.txt"
+
+    def __init__(self, logfiles=None, logdir=None):
+        self.logdir = logdir or self.LOGDIR
+        self.logfile = os.path.join(self.logdir, self.LOGFILENAME)
+        self.fd = None
+        self.year = datetime.now().year
+        self.reSep = re.compile("[:)]")
+
+        if logfiles:
+            self.logfiles = logfiles
+            self.nlogfiles = len(logfiles)
+            try:
+                self.logfile = self.logfiles.pop(0)
+            except IndexError:
+                raise StopIteration
+            self.fd, self.inode = self.open_with_inode(self.logfile)
+        else:
+            self.nlogfiles = 0
+            if os.path.exists(self.logfile):
+                self.fd, self.inode = self.open_with_inode(self.logfile)
+                self.fd.seek(0, os.SEEK_END)
+
+    def __next__(self):
+        if not self.fd:
+            if not os.path.exists(self.logfile):
+                return None
+            self.fd, self.inode = self.open_with_inode(self.logfile)
+        lines = []
+
+        while True:
+            try:
+                line = self.fd.readline()
+            except Exception:
+                self.fd, self.inode = self.open_with_inode(self.logfile)
+                continue
+
+            if not line:
+                if self.nlogfiles:
+                    self.fd.close()
+                    try:
+                        self.logfile = self.logfiles.pop(0)
+                    except IndexError:
+                        raise StopIteration
+                elif self.inode != os.stat(self.logfile).st_ino:
+                    self.fd, self.inode = self.open_with_inode(self.logfile)
+                else:
+                    return None
+
+            elif line.startswith("("):
+                lines.append(line)
+                _ = self.fd.readline()
+                while not lines[-1].startswith(("\n", "\r")):
+                    lines.append(self.fd.readline())
+
+                content_len = int(lines[-2].split()[1])
+                if content_len:
+                    content = self.fd.read(content_len)
+                    lines.append(content)
+
+                _, direction, hostip_port, proto = lines[0][20:].split()
+                hostip, port = hostip_port[1:-1].split(":")
+                rv = (
+                    self.strptime(lines[0]), direction, hostip,
+                    int(port), proto.strip(), "".join(lines[1:])
+                )
+                del lines[:]
+                return rv
+
+    def next(self):
+        return self.__next__()
+
+    def __iter__(self):
+        return self
+
+    @property
+    def progress(self):
+        """int: Returns the percentage of processed logfiles."""
+        if self.nlogfiles:
+            return int(100-(len(self.logfiles)/float(self.nlogfiles)*100))
+        return 100
+
+    def strptime(self, s):
+        """Converts string timestamp to datetime object.
+
+        Note:
+            This is 6 times faster than datetime.strptime().
+
+        Args:
+            s (str): sip.txt line with timestamp.
+
+        Returns:
+            datetime obj: datetime object.
+        """
+        return datetime(
+            self.year, int(s[1:3]), int(s[4:6]), int(s[7:9]),
+            int(s[10:12]), int(s[13:15]), int(s[16:19].ljust(6, "0"))
+        )
+
+    @staticmethod
+    def open_with_inode(logfile):
+        """Returns file handle and inode of logfile.
+
+        Args:
+            logfile (str): logfile including path.
+
+        Returns:
+            obj, int: file handler and its inode number.
+        """
+        inode = os.stat(logfile).st_ino
+        fd = open(logfile)
+        return fd, inode
+
+
+class AMS(object):
+    """Object to extract and manipulated AMS related data."""
+    def __init__(self, dbuser=None, dbpass=None, dbname=None):
+        self.dbuser = dbuser or "platdbuser"
+        self.dbpass = dbpass or "cGxhdGRicGFzcw=="
+        self.dbname = dbname or "emplatcore"
+        self._name = None
+        self._version = None
+        self.sip_tracecfg_filelevel_initial = self.sip_tracecfg_filelevel
+        self.active_sess_fields = [
+            'gslid', 'originator', 'audiocodec', 'videocodec',
+            'localip', 'localport', 'remoteip', 'remoteport',
+            'qosrfactor', 'qosmeanjit', 'qosmeanrtdelay',
+            'qoslocploss', 'qosremploss', 'qosremjit', 'startts'
+        ]
+        self.active_sess_fields_str = ",".join(self.active_sess_fields)
+        self.last_active_sess_ts = None
+        self.active_sess_initial = self.active_sess()
+
+    @property
+    def name(self):
+        """str: Returns the hostname of AMS."""
+        if self._name is None:
+            self._name = node().split(".")[0]
+        return self._name
+
+    @property
+    def version(self):
+        """str: Returns the version of AMS as per sysTool."""
+        if self._version is None:
+            source = "/boot/avaya-sys-update/update-tool/version.txt"
+            try:
+                with open(source) as fd:
+                    version = fd.read()
+                self._version = version.strip()
+            except Exception:
+                self._version = ""
+        return self._version
+
+    @property
+    def sip_tracecfg_filelevel(self):
+        """int: Returns trace_cfg filelevel for 'sip' module."""
+        return self._select_trace_cfg_filelevel("sip")
+
+    @sip_tracecfg_filelevel.setter
+    def sip_tracecfg_filelevel(self, value):
+        """Setter method for sip_tracecfg_filelevel property.
+
+        Args:
+            value (int): integer between 0 and 7 including 0 and 7
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: if value is outside of the allowed range.
+        """
+        if not 0 <= value <= 7:
+            raise ValueError("filelevel cannot be {0}".format(value))
+        self._update_trace_cfg("sip", value)
+
+    def sip_capture_start(self):
+        """Wrapper to update filelevel to 7 for 'sip' module.
+
+        Returns:
+            bool: True if execution was successful, False otherwise.
+        """
+        self.sip_tracecfg_filelevel = 7
+        return self.sip_tracecfg_filelevel == 7
+
+    def sip_capture_stop(self):
+        """Wrapper to update filelevel to 0 for 'sip' module.
+
+        Returns:
+            bool: True if execution was successful, False otherwise.
+        """
+        self.sip_tracecfg_filelevel = 0
+        return self.sip_tracecfg_filelevel == 0
+
+    def is_sip_capture_active(self):
+        """bool: Returns True if SIP capture is enabled."""
+        return self.sip_tracecfg_filelevel == 7
+
+    def active_sess(self):
+        """dict: Returns dictionary of active_sess with gslid as key."""
+        self.last_active_sess_ts = datetime.now()
+        act_sess = self._select_active_sess().strip()
+        if not act_sess:
+            return {}
+        return dict(
+            (x[0], OrderedDict(izip(self.active_sess_fields, x))) for x in
+            (line.split("\t") for line in act_sess.split("\n")) if x[4]
+        )
+
+    def _update_trace_cfg(self, module, filelevel):
+        """Updates module in trace_cfg table with filelevel value.
+
+        Args:
+            module (str): module name in trace_cfg table.
+            filelevel (int): filelevel value.
+
+        Returns:
+            bool: True if update was successul.
+        """
+        sqlcmd = "UPDATE trace_cfg SET filelevel={1} WHERE module='{0}'"
+        return self._exec_sql(sqlcmd.format(module, filelevel))
+
+    def _select_trace_cfg_filelevel(self, module):
+        """Queries module in trace_cfg table about its filelevel.
+
+        Args:
+            module (str): module name in trace_cfg table.
+
+        Returns:
+            int: filelevel value of module.
+        """
+        sqlcmd = "SELECT module,filelevel FROM trace_cfg WHERE module='{0}'"
+        rv = self._exec_sql(sqlcmd.format(module))
+        return int(rv.split()[1]) if rv else None
+
+    def _select_active_sess(self):
+        """str: Returns rows of active sessions."""
+        templ = "SELECT {0} FROM emplatcore.active_sess"
+        return self._exec_sql(templ.format(self.active_sess_fields_str))
+
+    def _exec_sql(self, cmd, silent=True):
+        """Helper method to execute the MYSQL command in subprocess.
+
+        Args:
+            cmd (str): complete MYSQL command executable from bash.
+
+        Returns:
+            str: return value from database command.
+        """
+        templ = "mysql -u{0} -p{1} -D {2} {3} -e \"{4}\";"
+        silent = "-s" if silent else ""
+        cmd = templ.format(
+            self.dbuser, b64decode(self.dbpass), self.dbname, silent, cmd
+        )
+        proc = Popen(shlex.split(cmd), shell=False, stdout=PIPE, stderr=PIPE)
+        data, err = proc.communicate()
+        if proc.returncode == 0:
+            return data
+        return ""
+
+
+##############################################################################
+#                                  sipmessage                                #
+##############################################################################
+
+
+class SIPMessage(object):
+    """Simple SIP message object to retrieve properties."""
+    def __init__(self, body, reinvite=False):
+        self._str = str(body).strip()
+        self._sdp = None
+        self._xml = None
+        self._sipfrag = None
+        self._digits = None
+        self._callid = None
+        self._gsid = 0
+        self._av_cm_id = None
+        self._gslid = None
+        self._referto = 0
+        self.reinvite = reinvite
+
+    @property
+    def size(self):
+        """int: Returns the size of the message."""
+        return len(self._str)
+
+    @property
+    def sdp(self):
+        """str: Returns SDP Content class instance."""
+        if self._sdp is None:
+            self._sdp = SDP(self.get_sdp())
+        return self._sdp
+
+    @property
+    def xml(self):
+        """str: Returns XML Content class instance."""
+        if self._xml is None:
+            self._xml = XML(self.get_xml())
+        return self._xml
+
+    @property
+    def sipfrag(self):
+        """str: Returns SIPFrag Content class instance."""
+        if self._sipfrag is None:
+            self._sipfrag = SIPFrag(self.get_sipfrag())
+        return self._sipfrag
+
+    @property
+    def digits(self):
+        """str: Returns Nortel Digits Content class instance."""
+        if self._digits is None:
+            self._digits = Digits(self.get_digits())
+        return self._digits
+
+    @property
+    def from_tag(self):
+        """str: Returns From header tag."""
+        tag = self.header_param("From", "tag")
+        if not tag:
+            tag = self.header_param("f", "tag")
+        return tag
+
+    @property
+    def to_tag(self):
+        """str: Returns To header tag."""
+        tag = self.header_param("To", "tag")
+        if not tag:
+            tag = self.header_param("t", "tag")
+        return tag
+
+    @property
+    def from_user(self):
+        """str: Returns From header user."""
+        user = self.header_uri_user("From")
+        if not user:
+            user = self.header_uri_user("f")
+        return user
+
+    @property
+    def to_user(self):
+        """str: Returns To header user."""
+        user = self.header_uri_user("To")
+        if not user:
+            user = self.header_uri_user("t")
+        return user
+
+    @property
+    def callid(self):
+        """str: Returns Call-ID."""
+        if self._callid is None:
+            self._callid = self.header("Call-ID")
+        return self._callid
+
+    @property
+    def gsid(self):
+        """str: Returns Av-Global-Session-ID."""
+        if self._gsid == 0:
+            hdr = self.header("Av-Global-Session-ID")
+            if hdr is None:
+                gsid = self.header_param("Contact", "gsid")
+                if gsid is None:
+                    gsid = self.header_param("m", "gsid")
+                self._gsid = gsid
+            else:
+                end = hdr.find(";")
+                if end < 0:
+                    end = len(hdr)
+                self._gsid = hdr[:end]
+        return self._gsid
+
+    @property
+    def av_cm_id(self):
+        """str: Returns av_cm_id if exists."""
+        if self._av_cm_id is not None:
+            return self._av_cm_id
+
+        if "av_cm_id" not in self._str:
+            self._av_cm_id = ""
+            return self._av_cm_id
+
+        start = self._str.find("av_cm_id=")
+        end = self._str.find(";", start)
+        if end < 0:
+            end = self._str.find("\n", start)
+        self._av_cm_id = self._str[start+9:end]
+        return self._av_cm_id
+
+    @property
+    def gslid(self):
+        """str: Returns x-nt-gslid header value."""
+        if self._gslid is None:
+            self._gslid = self.header("x-nt-gslid")
+        return self._gslid
+
+    @property
+    def referto_replaces_callid(self):
+        """str: Returns Call-ID from Replaces or Refer-To headers."""
+        hdr = self.header("Refer-To")
+        if not hdr:
+            hdr = self.header("r")
+        if hdr:
+            start = hdr.find(":")
+            if start >= 0:
+                end = hdr.find("@", start)
+                if end >= 0:
+                    referto = hdr[start+1:end]
+                    if "Replaces" not in hdr:
+                        return referto, None
+                    start = hdr.find("Replaces=")
+                    end = hdr.find("%", start)
+                    return referto, hdr[start+9:end]
+        return "", ""
+
+    @property
+    def replaces_callid(self):
+        """str: Returns Call-ID from the Replaces headers."""
+        hdr = self.header("Replaces")
+        if hdr:
+            end = hdr.find(";")
+            if end < 0:
+                end = None
+            return hdr[:end]
+        return ""
+
+    @property
+    def request(self):
+        """str: Returns request type."""
+        if self.is_response():
+            return ""
+        space = self._str.find(" ")
+        if space >= 0:
+            req = self._str[0:space]
+            if req == "INVITE" and self.reinvite and self.is_indialog_request():
+                req = "ReINVITE"
+            return req
+        return ""
+
+    @property
+    def response(self):
+        """str: Returns response code."""
+        if self.is_request():
+            return ""
+        status = self.response_status
+        if not status:
+            return ""
+        end = status.find(" ")
+        if end > -1:
+            return status[:end]
+        return ""
+
+    @property
+    def response_status(self):
+        """str: Returns full response."""
+        if self.is_request():
+            return ""
+        start = self._str.find(" ") + 1
+        if start >= 1:
+            end = self._str.find("\n")
+            if end > start:
+                return self._str[start:end].strip()
+        return ""
+
+    @property
+    def method(self):
+        """str: Returns method from CSeq header."""
+        return self.cseq()[1]
+
+    @property
+    def msgtype(self):
+        """str: Returns SIP msg type."""
+        if self.is_request():
+            return self.request
+        return self.response
+
+    def msgtype_method_tostr(self):
+        """str: Returns SIP msg type with medthod if msg is response."""
+        if self.is_request():
+            return self.request
+        return "{0} ({1})".format(self.response_status, self.method)
+
+    def msgtype_method(self):
+        """tuple: Returns descriptive msg type."""
+        if self.is_request():
+            return self.request, self.method
+        return self.response, self.method
+
+    @property
+    def protocol(self):
+        """str: Returns protocol type from top Via header."""
+        hdr = self.header("Via")
+        if not hdr:
+            hdr = self.header("v")
+        if hdr:
+            start = hdr.find("/2.0/")
+            if start >= 1:
+                end = hdr.find(" ", start)
+                return hdr[start+5:end]
+        return "UDP"
+
+    @property
+    def cseqno(self):
+        """str: Returns CSeq number."""
+        return self.cseq()[0]
+
+    @property
+    def local_tag(self):
+        """str: Returns local-tag from Endpoint-View header if exists."""
+        hdr = self.header("Endpoint-View")
+        if hdr:
+            start = hdr.find("local-tag=")
+            if start >= 0:
+                end = hdr.find(";", start)
+                if end < 0:
+                    end = len(hdr)
+                return hdr[start+10:end]
+        return ""
+
+    @property
+    def branch(self):
+        """str: Returns branch from top Via header."""
+        param = self.header_param("Via", "branch")
+        if not param:
+            return self.header_param("v", "branch")
+        return param
+
+    @property
+    def via_ipport(self):
+        """tuple: Returns IP and port from top Via header."""
+        hdr = self.header("Via")
+        if not hdr:
+            hdr = self.header("v")
+        if hdr:
+            end = hdr.find(";", 12)
+            ipport = hdr[12:end]
+            if ":" in ipport:
+                ip, port = hdr[12:end].split(":")
+                return ip, int(port)
+            return hdr[12:end], 5060
+        return "", ""
+
+    @property
+    def content(self):
+        """str: Returns SIP msg Content if exists."""
+        start = self._str.find("\n\n")
+        if start == -1:
+            start = self._str.find("\r\n\r\n")
+        if start > -1:
+            return self._str[start+2:]
+        return ""
+
+    def header(self, header_name):
+        """Returns content of header_name.
+
+        Args:
+            header_name (str): header name without ":" to be retrieved.
+
+        Returns:
+            str: content of header identified by header_name.
+        """
+        if header_name == "Request":
+            start = 0
+        else:
+            start = self._str.find(header_name + ":")
+        if start == -1:
+            return ""
+        end = self._str.find("\n", start)
+        if end == -1:
+            end = self.size
+        if header_name == "Request":
+            return self._str[start:end].strip()
+        else:
+            return self._str[start+len(header_name)+1:end].strip()
+
+    def header_param(self, header_name, param):
+        """Returns param value from header_name.
+
+        Args:
+            header_name (str): header name without ":".
+            param (str): parameter name to retrieve from header_name.
+
+        Returns:
+            str: param value.
+        """
+        hdr = self.header(header_name)
+        if hdr:
+            start = hdr.find(param)
+            if start >= 0:
+                start += len(param)
+                if hdr[start] == "=":
+                    start += 1
+                end = hdr.find(";", start)
+                if end < 0:
+                    end = hdr.find(">", start)
+                    if end < 0:
+                        end = len(hdr)
+                if end > 0:
+                    return hdr[start:end]
+        return ""
+
+    def header_uri(self, header_name):
+        """Return URI of header_name.
+
+        Note:
+            For Request URI use "Request" for header_name.
+
+        Args:
+            header_name (str): header name without ":".
+
+        Returns:
+            str: user@domain:port of header_name.
+        """
+        hdr = self.header(header_name)
+        if not hdr:
+            return ""
+        start = hdr.find(" ")
+        end = hdr.find(";")
+        if end < 0:
+            end = hdr.find("\n")
+        return hdr[start:end].strip()
+
+    def header_uri_user(self, header_name):
+        """Returns user from header identified by header_name.
+
+        Args:
+            header_name (str): header name without ":".
+
+        Returns:
+            str: user.
+        """
+        hdr = self.header(header_name)
+        if not hdr:
+            return ""
+        start = hdr.find(":")
+        if start >= 0:
+            user = hdr[start + 1:]
+        end = user.find(";")
+        if end < 0:
+            end = len(hdr)
+        user = user[:end]
+        end = user.find("@")
+        if end < 0:
+            end = user.find("%40")
+        if end >= 0:
+            user = user[0:end]
+        return user.rstrip(">")
+
+    def is_offhook_ec500_request(self):
+        """bool: Returns True if first line contains offhook or ec500 fnu."""
+        end = self._str.find("\n")
+        hdr = self._str[0:end]
+        return ("avaya-cm-fnu=off-hook" in hdr or
+                "avaya-cm-fnu=ec500" in hdr)
+
+    def cseq(self):
+        """tuple: Returns CSeq number and method."""
+        hdr = self.header("CSeq")
+        if hdr:
+            lst = hdr.split()
+            if len(lst) == 2:
+                return int(lst[0]), lst[1].rstrip()
+        return "", ""
+
+    def content_type(self):
+        """str: Returns Content-Type header value."""
+        hdr = self.header("Content-Type")
+        return hdr.strip()
+
+    def get_sdp(self):
+        """str: Returns the SDP content."""
+        start = self._str.find("\nv=")
+        if start > -1:
+            end = self._str.find("\n", start)
+            if end > -1:
+                return self._str[end:].lstrip()
+        return ""
+
+    def get_xml(self):
+        """str: Returns the XML content."""
+        if self.is_content_xml():
+            start = self._str.find("<?xml")
+            if start > -1:
+                return self._str[start:].strip()
+        return ""
+
+    def get_sipfrag(self):
+        """str: Returns the SIPFrag content."""
+        if self.is_content_sipfrag():
+            start = self._str.find("\r\n\r\n")
+            if start > -1:
+                return self._str[start:].strip()
+        return ""
+
+    def get_digits(self):
+        """str: Returns the Nortel Digits content."""
+        if self.is_content_digits():
+            start = self._str.find("\r\n\r\n")
+            if start > -1:
+                return self._str[start:].strip()
+        return ""
+
+    def has_content(self):
+        """bool: Returns True if message has Content."""
+        content_length = self.header("Content-Length")
+        return False if not content_length else int(content_length) > 0
+
+    def is_content_sdp(self):
+        """bool: Returns True if content type is SDP."""
+        return self.has_content and self.content_type().endswith("sdp")
+
+    def is_content_xml(self):
+        """bool: Returns True if content type is XML."""
+        return self.has_content and self.content_type().endswith("xml")
+
+    def is_content_sipfrag(self):
+        """bool: Returns True if content type is Sipfrag."""
+        return self.has_content and self.content_type().endswith("sipfrag")
+
+    def is_content_digits(self):
+        """bool: Returns True if content type is Nortel Digits."""
+        return self.has_content and self.content_type().endswith("digits")
+
+    def is_indialog_request(self):
+        """bool, None: Returns True if message has "tag" in "To" header."""
+        return None if not self.size else bool(
+            self.header_param("To", "tag") or
+            self.header_param("t", "tag")
+        )
+
+    def is_response(self):
+        """bool, None: Returns True if message is a response."""
+        return None if not self.size else (
+               self._str.startswith(("SIP/2.0", "sip/2.0")))
+
+    def is_request(self):
+        """bool, None: Returns True if message is a request."""
+        return None if not self.size else (
+               not self.is_response())
+
+    def has_replaces(self):
+        """bool: Returns True if message has Replaces header."""
+        return None if not self.size else bool(self.header("Replaces"))
+
+    def tostring(self):
+        """str: Returns the SIP message as a string."""
+        return self._str.strip()
+
+    def __contains__(self, item):
+        return item in self._str
+
+    def __len__(self):
+        return self.size
+
+    def __str__(self):
+        return self._str
+
+
+class SDP(object):
+    """SDP parser class."""
+    PAYLOAD = {
+        0: "G711U",
+        4: "G723",
+        8: "G711A",
+        9: "G722",
+        18: "G729",
+    }
+
+    def __init__(self, body):
+        self._str = body
+        self._session_attrs = None
+        self._audio_attrs = None
+        self._video_attrs = None
+        self._image_attrs = None
+        self._audio_ip = None
+        self._audio_port = None
+        self._audio_codec_name = None
+        self._video_ip = None
+        self._video_port = None
+        self._video_codec_name = None
+        self._session_info = None
+        self.reConnAddr = re.compile(r"c=IN IP4 (\d+.\d+.\d+.\d+).*")
+        self.rePortCodec = re.compile(r"m=\w+ (\d+) S?RTP/S?AVP (\d+).*")
+        self.reSessIdVerOrig = re.compile(r"o=\S+ (\d+) (\d+) IN IP4 (\d+.\d+.\d+.\d+).*")
+
+    @property
+    def session_attrs(self):
+        """str: Returns Session attributes of SDP."""
+        if self._session_attrs is None:
+            self._session_attrs = self.get_session_attrs()
+        return self._session_attrs
+
+    @property
+    def audio_attrs(self):
+        """str: Returns audio attributes of SDP."""
+        if self._audio_attrs is None:
+            self._audio_attrs = self.get_other_attrs("audio")
+        return self._audio_attrs
+
+    @property
+    def video_attrs(self):
+        """str: Returns video attributes of SDP."""
+        if self._video_attrs is None:
+            self._video_attrs = self.get_other_attrs("video")
+        return self._video_attrs
+
+    @property
+    def image_attrs(self):
+        """str: Returns image attributes of SDP."""
+        if self._image_attrs is None:
+            self._image_attrs = self.get_other_attrs("image")
+        return self._image_attrs
+
+    @property
+    def audio_ip(self):
+        """str: Returns IP of audio media of SDP."""
+        if self._audio_ip is None:
+            self._audio_ip = self.get_audio_addr()
+        return self._audio_ip
+
+    @property
+    def audio_port(self):
+        """str: Returns port of audio media of SDP."""
+        if self._audio_port is None:
+            self._audio_port = self.get_audio_port_payload()[0]
+        return self._audio_port
+
+    @property
+    def audio_codec_name(self):
+        """str: Returns codec name of audio media of SDP."""
+        if self._audio_codec_name is None:
+            _, payload = self.get_audio_port_payload()
+            if payload is None:
+                self._audio_codec_name = ""
+            else:
+                codec_name = self.PAYLOAD.get(payload, None)
+                if codec_name is None:
+                    codec_name = self.get_audio_payload_name_clockrate(payload)[0]
+                if codec_name == "G729" and self.is_annexb_yes():
+                    codec_name += "B"
+                self._audio_codec_name = codec_name.upper()
+        return self._audio_codec_name
+
+    @property
+    def video_ip(self):
+        """str: Returns IP of video media of SDP."""
+        if self._video_ip is None:
+            self._video_ip = self.get_video_addr()
+        return self._video_ip
+
+    @property
+    def video_port(self):
+        """str: Returns port of video media of SDP."""
+        if self._video_port is None:
+            self._video_port = self.get_video_port_payload()[0]
+        return self._video_port
+
+    @property
+    def video_codec_name(self):
+        """str: Returns codec name of video media of SDP."""
+        if self._video_codec_name is None:
+            payload = self.get_video_port_payload()[1]
+            if payload is None:
+                self._video_codec_name = ""
+            else:
+                codec_name = self.get_video_payload_name_clockrate(payload)[0]
+                self._video_codec_name = codec_name.upper() if codec_name else ""
+        return self._video_codec_name
+
+    @property
+    def session_info(self):
+        """str: Returns session info of SDP."""
+        if self._session_info is None:
+            self._session_info = self.get_session_info()
+        return self._session_info
+
+    def get_session_attrs(self):
+        """str: Returns session attributes of SDP."""
+        end = self._str.find("m=")
+        if end < 0:
+            end = len(self._str)
+        return self._str[:end].strip()
+
+    def get_other_attrs(self, type):
+        """str: Returns media attributes of SDP."""
+        start = self._str.find("m=" + type)
+        if start < 0:
+            return ""
+        end = self._str.find("m=", start+1)
+        if end < 0:
+            end = len(self._str)
+        return self._str[start:end].strip()
+
+    def get_session_addr(self):
+        """str: Returns IP from session attributes of SDP."""
+        m = self.reConnAddr.search(self.session_attrs)
+        try:
+            return m.group(1)
+        except AttributeError:
+            return ""
+
+    def get_audio_addr(self):
+        """str: Returns IP from audio attributes of SDP."""
+        m = self.reConnAddr.search(self.audio_attrs)
+        if not m:
+            m = self.reConnAddr.search(self.session_attrs)
+        try:
+            return m.group(1)
+        except AttributeError:
+            return ""
+
+    def get_video_addr(self):
+        """str: Returns IP from video attributes of SDP."""
+        m = self.reConnAddr.search(self.video_attrs)
+        if not m:
+            m = self.reConnAddr.search(self.session_attrs)
+        try:
+            return m.group(1)
+        except AttributeError:
+            return ""
+
+    def get_image_addr(self):
+        """str: Returns IP from image attributes of SDP."""
+        m = self.reConnAddr.search(self.image_attrs)
+        if not m:
+            m = self.reConnAddr.search(self.session_attrs)
+            try:
+                return m.group(1)
+            except AttributeError:
+                return ""
+
+    def get_session_info(self):
+        """list: Returns session infos."""
+        m = self.reSessIdVerOrig.search(self.session_attrs)
+        try:
+            return m.group(1, 2, 3)
+        except AttributeError:
+            return ""
+
+    def get_audio_port_payload(self):
+        """tuple: Returns port and codec number of audio media."""
+        m = self.rePortCodec.search(self.audio_attrs)
+        try:
+            return tuple(int(x) for x in m.group(1, 2))
+        except AttributeError:
+            return "", ""
+
+    def get_video_port_payload(self):
+        """tuple: Returns port and codec number of video media."""
+        m = self.rePortCodec.search(self.video_attrs)
+        try:
+            return tuple(int(x) for x in m.group(1, 2))
+        except AttributeError:
+            return "", ""
+
+    def get_audio_payload_name_clockrate(self, payload):
+        """tuple: Returns audio codec number and clockrate."""
+        m = re.search(r"a=rtpmap:%s (\w+)/(\d+).*" % payload, self.audio_attrs)
+        try:
+            return m.group(1, 2)
+        except AttributeError:
+            return "", ""
+
+    def get_video_payload_name_clockrate(self, payload):
+        """tuple: Returns video codec number and clockrate."""
+        m = re.search(r"a=rtpmap:%s (\w+)/(\d+).*" % payload, self.video_attrs)
+        try:
+            return m.group(1, 2)
+        except AttributeError:
+            return "", ""
+
+    def is_annexb_yes(self):
+        """bool: Returns True if audio codec is G.729B."""
+        return "a=fmtp:18 annexb=yes" in self.audio_attrs
+
+    def is_audio_onhold(self):
+        """bool: Returns True if audio media is NOT sendrcv."""
+        return ("a=recvonly" in self.audio_attrs or
+                "a=sendonly" in self.audio_attrs or
+                "a=inactive" in self.audio_attrs)
+
+    def is_video_inactive(self):
+        """bool: Returns True if video media is inactive."""
+        return ("a=inactive" in self.video_attrs)
+
+    def has_audio_crypto(self):
+        """bool: returns True if audio has crypto key."""
+        return "a=crypto:1" in self.audio_attrs
+
+    def has_video(self):
+        """bool: Returns True if video media is available."""
+        video_addr = self.get_video_addr()
+        return (video_addr and video_addr != "0.0.0.0" and
+                bool(self.get_video_port_payload()[0]) and
+                not self.is_video_inactive())
+
+    def tostring(self):
+        """str: Returns the content as string."""
+        return self._str.strip()
+
+    def __str__(self):
+        return self._str
+
+
+class XML(object):
+    """XML content class."""
+    def __init__(self, body):
+        self._str = body
+        self._d = parse_xml(body)
+        self.rsplit = re.compile(r"_|/")
+
+    def is_msml(self):
+        """bool: Returns True if XML is of type MSML."""
+        return "msml" in self._d
+
+    def is_media_server_perf(self):
+        """bool: Returns True if XM is of type MediaServerPerf."""
+        return "MediaServerPerf" in self._d
+
+    @property
+    def MediaServerOperState(self):
+        """str: Returns MediaServerOperState."""
+        try:
+            return self._d["MediaServerPerf"].get("MediaServerOperState", "")
+        except:
+            return ""
+
+    @property
+    def LoadFactor(self):
+        """str: Returns LoadFactor value."""
+        try:
+            return self._d["MediaServerPerf"].get("LoadFactor", "")
+        except:
+            return ""
+
+    @property
+    def msml_root_tag(self):
+        """str: Returns root tag of MSML content."""
+        try:
+            return next(x for x in self._d["msml"] if x != "version")
+        except:
+            return ""
+
+    @property
+    def dialog_name(self):
+        """str: Returns dialog name of root tag."""
+        d = self._d["msml"][self.msml_root_tag]
+        if "name" in d:
+            return d["name"]
+        try:
+            return d["id"].split("dialog:")[1]
+        except:
+            return ""
+
+    @property
+    def announ(self):
+        """str: Returns announcement name of dialog."""
+        tag = self.msml_root_tag
+        if tag == "csquery":
+            return self._d["msml"][tag].get("id", "")
+        elif tag == "dialogstart" and self.dialog_name.startswith("ANNC"):
+            try:
+                return self._d["msml"][tag]["play"]["audio"]["uri"]
+            except:
+                return ""
+        return ""
+
+    @property
+    def result_resp_descr(self):
+        """tuple: Returns response and description of result MSML."""
+        tag = self.msml_root_tag
+        if tag == "result":
+            return (self._d["msml"][tag].get("response", ""),
+                    self._d["msml"][tag].get("description", ""))
+        return "", ""
+
+    @property
+    def event_name(self):
+        """str: Returns event name of MSML."""
+        tag = self.msml_root_tag
+        if tag == "event":
+            return self._d["msml"][tag].get("name", "")
+        return ""
+
+    def tostring(self):
+        """str: Returns the content as string."""
+        return self._str.strip()
+
+    def __str__(self):
+        return self._str
+
+
+class SIPFrag(object):
+    """SIPFrag content class."""
+    def __init__(self, body):
+        self._str = body
+
+    def tostring(self):
+        """str: returns the SDP as string."""
+        return self._str.strip()
+
+    def __str__(self):
+        return self._str
+
+
+class Digits(object):
+    """Nortel Digits content class."""
+    def __init__(self, body):
+        self._str = body
+
+    @property
+    def d(self):
+        """str: Returns digit value."""
+        start = self._str.find("d=")
+        if start > -1:
+            end = self._str.find("\n", start)
+            if end > -1:
+                return self._str[start+2:end].strip()
+            return self._str[start+2:].strip()
+        return ""
+
+    def tostring(self):
+        """str: Returns the content as string."""
+        return self._str.strip()
+
+    def __str__(self):
+        return self._str
+
+
+##############################################################################
+#                                    winmgr                                  #
+##############################################################################
+
+
+def coroutine(func):
+    """Decorator: primes `func` by advancing to first `yield`"""
+    @wraps(func)
+    def primer(*args, **kwargs):
+        gen = func(*args, **kwargs)
+        next(gen)
+        return gen
+    return primer
+
+
+class SIPRecord(object):
+    """Stores SIP message related information and access methods."""
+    __slots__ = ["timestamp", "direction", "host", "port", "proto", "sipmsg"]
+
+    def __init__(self, timestamp, direction, host, port, proto, sipmsg):
+        self.timestamp = timestamp
+        self.direction = 0 if direction == "OUTGOING" else 1
+        self.host = host
+        self.port = port
+        self.proto = proto
+        self.sipmsg = SIPMessage(sipmsg)
+
+    @property
+    def cmcid(self):
+        """str: Returns ACM (CM) callid (cid)."""
+        av_cm_id = self.sipmsg.av_cm_id
+        return av_cm_id.split("-", 2)[1] if av_cm_id else ""
+
+    @property
+    def ts(self):
+        """str: Returns timestamp in hh:mm:ss.millisec format."""
+        return self.timestamp.strftime('%H:%M:%S.%f')[:12]
+
+    @property
+    def title(self):
+        """str: Returns msgwin title showing peer host:port and direction."""
+        arrow = "── {0} ──►" if self.direction else "◄── {0} ──"
+        return "{0}:{1} {2} AMS".format(
+            self.host, self.port, arrow.format(self.proto))
+
+    @property
+    def sum(self):
+        """str: Returns record summary, displayed in rightwin."""
+        o = []
+
+        av_cm_id = self.sipmsg.av_cm_id
+        if av_cm_id:
+            cmcid = av_cm_id.split("-")[1]
+            o.append("cid:{0}".format(
+                "igc" if "igc" in av_cm_id else cmcid
+            ))
+
+        if self.sipmsg.is_response():
+            o.append(self.sipmsg.msgtype_method_tostr())
+        else:
+            if self.sipmsg.msgtype == "INVITE":
+                if "igc" not in av_cm_id:
+                    uid_ext = " ".join(
+                        ":".join(x) for x in zip(
+                            ("uid", "ext"), av_cm_id.split("-")[3:]
+                        )
+                    )
+                    o.append(uid_ext)
+            elif self.sipmsg.msgtype == "REFER":
+                o.append("av_cm_id:{0}".format(av_cm_id))
+            elif not self.sipmsg.has_content():
+                o.append(self.sipmsg.header_uri("Request"))
+
+        if self.sipmsg.has_content():
+            if self.sipmsg.is_content_xml():
+                o.append(self._parse_xml())
+            elif self.sipmsg.is_content_sdp():
+                if self.sipmsg.msgtype != "REFER":
+                    o.append(self._parse_sdp())
+            elif self.sipmsg.is_content_sipfrag():
+                o.append(self._parse_sipfrag())
+            elif self.sipmsg.is_content_digits():
+                o.append("Digit={0}".format(self.sipmsg.digits.d))
+
+        if not o:
+            o.append(self.sipmsg.header_uri("Request"))
+
+        return " ".join(o)
+
+    def _parse_sdp(self):
+        """str: Returns SDP Content summary."""
+        o = []
+        audio_ip = self.sipmsg.sdp.audio_ip
+        audio_port = self.sipmsg.sdp.audio_port
+        if audio_port:
+            o.append("(SDP audio {0}:{1})".format(audio_ip, audio_port))
+        else:
+            o.append("(SDP audio {0})".format(audio_ip))
+        video_ip = self.sipmsg.sdp.video_ip
+        video_port = self.sipmsg.sdp.video_port
+        if video_ip and video_port:
+            o.append("(SDP video {0}:{1})".format(video_ip, video_port))
+        return " ".join(o)
+
+    def _parse_xml(self):
+        """str: Returns XML Content summary."""
+        o = []
+        if self.sipmsg.xml.is_media_server_perf():
+            o.append("State:{0}".format(self.sipmsg.xml.MediaServerOperState))
+            o.append("LoadFactor:{0}".format(self.sipmsg.xml.LoadFactor))
+        elif self.sipmsg.xml.is_msml():
+            tag = self.sipmsg.xml.msml_root_tag
+            o.append(tag)
+            if tag in ("dialogstart", "dialogend", "csquery"):
+                name = self.sipmsg.xml.dialog_name.split("_ID", 1)
+                if name:
+                    o.append(name[0])
+                ann = self.sipmsg.xml.announ
+                if ann:
+                    o.append("'{0}'".format(ann))
+            elif tag == "result":
+                o.append("{0} {1}".format(*self.sipmsg.xml.result_resp_descr))
+            elif tag == "event":
+                o.append(self.sipmsg.xml.event_name)
+        return " ".join(o)
+
+    def _parse_sipfrag(self):
+        """str: Returns SIPFrag Content summary."""
+        return "Sipfrag:{0}".format(
+            self.sipmsg.sipfrag.tostring().replace("SIP/2.0 ", "")
+        )
+
+
+class SlicableODict(OrderedDict):
+    """Slicable OrderedDict implementation.
+    SlicableODict[0:15] returns SlicableODict of first 15 key/value pairs.
+    """
+    def index(self, k):
+        return next(i for i, key in enumerate(self) if key == k)
+
+    def __getitem__(self, k):
+        if isinstance(k, slice):
+            if k.start is None:
+                start = 0
+            elif k.start < 0:
+                start = OrderedDict.__len__(self) + k.start
+            else:
+                start = k.start
+            if k.stop is None:
+                stop = OrderedDict.__len__(self)
+            elif k.stop < 0:
+                stop = OrderedDict.__len__(self) + k.stop
+            else:
+                stop = k.stop
+            return SlicableODict(islice(self.items(), start, stop, k.step))
+        elif isinstance(k, int):
+            start = OrderedDict.__len__(self) + k if (k < 0) else k
+            return next(islice(self.items(), start, start+1))
+        else:
+            return OrderedDict.__getitem__(self, k)
+
+
+class Winmgr(object):
+    """TUI interface manager using the curses library."""
+    def __init__(self, maxlen=10000, logfiles=None, active_sess_update_secs=3,
+                 debug=False, skin_mono=False):
+        self.maxlen = maxlen
+        self.logfiles = logfiles
+        self.active_sess_cumu_update_secs = active_sess_update_secs
+        self.debug = debug
+        self.ams = AMS()
+        self.SIPLogReader = SIPLogReader
+        self.capture_active = self.ams.is_sip_capture_active()
+        self.siplogreader = SIPLogReader() if self.capture_active else None
+        self.db = []
+        self.idx = []
+        self.active_sess_cumu = SlicableODict()
+        self.active_sess_last = SlicableODict()
+        self.breakout = False
+        self.refresh = False
+        self.skin_mono = skin_mono
+        self.hosts = ["AMS"]
+        self.xpos = 0
+        self.curpos = -1
+        self.idxpos = 0
+        self.refresh = False
+        self.autoscroll = True
+        self.filterstr = ""
+        self.filter_cmcid = set()
+        self.filter_callid = set()
+        self.filter_ip = set()
+        self.filter_method = set()
+        self.filter_regex = None
+        self.callids = {}
+        self.gslid_to_avcmid = {}
+        self.gslid_to_callid = {}
+        self.maxrss = self.memory_usage_resource()
+        self.min_width = 80
+        self.min_height = 20
+        self.column_width = 13
+        self.leftwin_width = 13
+        self.min_rigthwin_width = (
+            self.min_width - self.leftwin_width - 1 * (self.column_width) - 1
+        )
+        self.hostpad_smaxcol = self.leftwin_width + 2 * self.column_width
+
+        self.ch_methods = {
+            "KEY_RESIZE": self.ch_resize,
+            "KEY_UP": self.ch_up,
+            "KEY_DOWN": self.ch_down,
+            "KEY_PPAGE": self.ch_ppage,
+            "KEY_NPAGE": self.ch_npage,
+            "KEY_HOME": self.ch_home,
+            "KEY_END": self.ch_end,
+            "KEY_RIGHT": self.ch_right,
+            "KEY_LEFT": self.ch_left,
+            "KEY_ENTER": self.ch_enter,
+            "^J": self.ch_enter,
+            "C": self.ch_c,
+            "D": self.ch_d,
+            "F": self.ch_f,
+            "G": self.ch_g,
+            "S": self.ch_s,
+            "Q": self.ch_q,
+        }
+
+    def initcolors(self):
+        """Initializes curses colors and color pairs."""
+        for i in range(0, curses.COLORS):
+            curses.init_pair(i + 1, i, -1)
+
+        self.color_zoo = (
+            2, 3, 4, 5, 6, 7, 126, 95, 203, 246, 125, 11, 143, 13, 14, 140,
+            137, 145, 30, 15, 185, 36, 129, 41, 166, 28, 47, 166, 161, 71,
+            34, 171, 77, 88, 178, 83, 197, 208, 191, 229, 118, 214
+        )
+
+        self.colors = {
+            "white": curses.color_pair(0),
+            "red": curses.color_pair(161),
+            "green": curses.color_pair(41),
+            "purple": curses.color_pair(213),
+            "gray": curses.color_pair(242),
+            "orange": curses.color_pair(209),
+        }
+
+    def _initwins(self):
+        """Initializes windows, pads."""
+        self.my, self.mx = self.stdscr.getmaxyx()
+        self.stdscr.erase()
+        self.stdscr.refresh()
+        self.nrows = self.my - 6
+        self.maxcols = (
+            (self.mx - self.min_rigthwin_width - self.leftwin_width) //
+            self.column_width
+        )
+        self.callstitlepad = curses.newpad(4, 165)
+        self.callspad = curses.newpad(self.my - 5, 165)
+        self.hostpad = curses.newpad(
+            2, self.leftwin_width + 2 * self.column_width
+        )
+        self.menuwin = curses.newwin(1, self.mx + 1, self.my - 1, 0)
+        self.leftwin = curses.newwin(self.nrows, self.leftwin_width + 1, 4, 0)
+        self.ladderpad = curses.newpad(self.nrows, self.column_width + 1)
+        self.rightwin = curses.newwin(
+            self.nrows + 1, self.mx - self.leftwin_width - self.column_width,
+            4, self.leftwin_width + self.column_width
+        )
+
+    def main(self, stdscr):
+        """Provides the entry point of the application.
+
+        Args:
+            stdscr (obj): curses default screen.
+
+        Returns:
+            None
+        """
+        self.stdscr = stdscr
+        curses.noecho()
+        curses.start_color()
+        curses.use_default_colors()
+        curses.curs_set(0)
+        self.initcolors()
+        while not self.breakout:
+            self.my, self.mx = self.stdscr.getmaxyx()
+            if (self.mx < self.min_width or self.my < self.min_height):
+                self.stdscr.erase()
+                self.stdscr.refresh()
+                self.draw_resizewin()
+            else:
+                self._initwins()
+                self.event_loop()
+        self.exit()
+
+    def event_loop(self):
+        """Main event loop."""
+        if self.logfiles:
+            self.draw_loadwin()
+            self.stdscr.erase()
+        self.refreshall()
+        self.update_title()
+        self.stdscr.timeout(300)
+        self.active = self.stdscr
+        if self.autoscroll:
+            self.ch_end()
+        try:
+            while True:
+                if self.capture_active:
+                    self.refresh = False
+                    while True:
+                        msg = next(self.siplogreader)
+                        if msg:
+                            if len(self.db) < self.maxlen:
+                                self.update_db(msg)
+                            else:
+                                self.update_title()
+                                break
+                        else:
+                            break
+                    if self.refresh and self.active == self.stdscr:
+                        self.refreshall()
+
+                if self._is_active_sess_update_due():
+                    self.active_sess_last = self.ams.active_sess()
+                    self.active_sess_cumu.update(
+                        dict((k, v) for k, v in self.active_sess_last.iteritems()
+                             if k in self.gslid_to_callid)
+                    )
+                    self.maxrss = self.memory_usage_resource()
+                    self.update_title()
+
+                ch = self.stdscr.getch()
+                chstr = curses.keyname(ch) if ch != -1 else "NONE"
+                if self.active == self.stdscr:
+                    key = chstr.upper()
+                    if key in self.ch_methods:
+                        self.ch_methods[key]()
+                else:
+                    if chstr == "KEY_RESIZE":
+                        self.ch_resize()
+                    try:
+                        _ = self.active.send(chstr)
+                    except Exception:
+                        self.active = self.stdscr
+                        self.refreshall(active=True)
+                if self.breakout:
+                    break
+        except Exception:
+            if self.debug:
+                logging.exception("Exception In Event Loop")
+
+    def draw_top(self, active=True):
+        """Draws frame of the top portion where the host addresses are.
+
+        Args:
+            active (bool, optional): True if this part of the screen is
+                active (on the top) or False otherwise.
+
+        Returns:
+            None
+        """
+        if not self.idx:
+            return
+        c = self.color("white", active)
+        num_of_visible_hosts = min(len(self.hosts), self.maxcols + 1)
+        for i in (0, 3):
+            self.stdscr.addstr(i, 0, self.mx * "─", c)
+        for i in range(0, num_of_visible_hosts):
+            self.stdscr.addstr(
+                3, self.leftwin_width + i * self.column_width, "┬", c
+            )
+        self.stdscr.refresh()
+
+    def draw_hostpad(self, active=True):
+        """Draws/resizes the host addresses in a pad.
+
+        Args:
+            active (bool, optional): True if this part of the screen is
+                active (on the top) or False otherwise.
+
+        Returns:
+            None
+        """
+        if not self.idx:
+            return
+        width = self.hostpad.getmaxyx()[1]
+        newwidth = (len(self.hosts) + 2) * self.column_width
+        if newwidth > width:
+            self.hostpad.resize(2, newwidth)
+            width = newwidth
+
+        c = self.color("white", active)
+        line0 = "".join("{0:^{1}}".format(x, self.column_width * 2)
+                        for x in self.hosts[::2]).ljust(width)
+        line1 = "".join((self.column_width * " ",
+                        "".join("{0:^{1}}".format(x, self.column_width * 2)
+                                for x in self.hosts[1::2])))
+        self.hostpad.addstr(0, 0, line0, c)
+        self.hostpad.addstr(1, 0, line1, c)
+        self.hostpad.refresh(0, self.xpos, 1, 1, 2, self.hostpad_smaxcol)
+
+    def refresh_hostpad(self):
+        """Refreshes the hostpad when moving left or right."""
+        self.hostpad.refresh(0, self.xpos, 1, 1, 2, self.hostpad_smaxcol)
+
+    def draw_leftwin(self, active=True):
+        """Draws the left side where the timestamps are.
+
+        Args:
+            active (bool, optional): True if this part of the screen is
+                active (on the top) or False otherwise.
+
+        Returns:
+            None
+        """
+        if not self.idx:
+            return
+        c = self.color("white", active)
+        w = self.column_width
+        for y, p in enumerate(range(self.idxpos, self.idxpos + self.nrows)):
+            try:
+                self.leftwin.addstr(y, 0, self.db[self.idx[p]].ts.ljust(w), c)
+            except IndexError:
+                pass
+        self.leftwin.refresh()
+
+    def draw_ladderpad(self, active=True):
+        """Draws/resizes the ladder diagram between AMS and peer hosts.
+
+        Args:
+            active (bool, optional): True if this part of the screen is
+                active (on the top) or False otherwise.
+
+        Returns:
+            None
+        """
+        if not self.idx:
+            return
+        width = self.ladderpad.getmaxyx()[1]
+        newwidth = (len(self.hosts) - 1) * self.column_width + 2
+        if newwidth > width:
+            self.ladderpad.resize(self.nrows, newwidth)
+            width = newwidth
+        for r, p in enumerate(range(self.idxpos, self.idxpos + self.nrows)):
+            c = self.color("white", active)
+            if r == self.curpos:
+                self.ladderpad.addstr(r, 0, " " * (width - 1), c | curses.A_REVERSE)
+            else:
+                self.ladderpad.addstr(r, 0, " " * (width - 1), c)
+            for i, h in enumerate(self.hosts):
+                try:
+                    if h == self.db[self.idx[p]].host:
+                        m = self.db[self.idx[p]].sipmsg.msgtype
+
+                        if self.db[self.idx[p]].host == self.hosts[0]:
+                            ndash = self.column_width - 2
+                            start = ((ndash // 2 + 1) - (len(m) // 2))
+                            x = 1
+
+                            if self.db[self.idx[p]].direction:
+                                arrow = ["─"] * ndash + ["▶"]
+                            else:
+                                arrow = ["◀"] + ["─"] * ndash
+
+                        else:
+                            ndash = self.column_width * (i - 1) - 2
+                            start = ((ndash // 2 + 1) - (len(m) // 2))
+                            x = self.column_width + 1
+
+                            if self.db[self.idx[p]].direction:
+                                arrow = ["◀"] + ["─"] * ndash
+                            else:
+                                arrow = ["─"] * ndash + ["▶"]
+
+                        arrow[start:start + len(m)] = m
+                        zooidx = (
+                            (self.callids[self.db[self.idx[p]].sipmsg.callid] - 1)
+                            % len(self.color_zoo)
+                        )
+                        c = self.color(zooidx, active)
+                        if r == self.curpos:
+                            c |= curses.A_REVERSE
+                        self.ladderpad.addstr(r, x, "".join(arrow), c)
+                    self.ladderpad.addstr(r, i * self.column_width, "│",
+                                          self.color("white", active))
+                except IndexError:
+                    pass
+        self.ladderpad.refresh(0, self.xpos, 4, self.leftwin_width,
+                               self.nrows + 3, self.ladderpad_smaxcol)
+
+    def refresh_ladderpad(self):
+        """Refreshes the ladderpad when moving left or right."""
+        self.ladderpad.refresh(0, self.xpos, 4, self.leftwin_width,
+                               self.nrows + 3, self.ladderpad_smaxcol)
+
+    def draw_rightwin(self, active=True):
+        """Draws/resizes the rigthwin where the message summaries are.
+
+        Args:
+            active (bool, optional): True if this part of the screen is
+                active (on the top) or False otherwise.
+
+        Returns:
+            None
+        """
+        if not self.idx:
+            return
+        num_of_visible_cols = min(len(self.hosts) - 1, self.maxcols)
+        width = self.rightwin.getmaxyx()[1]
+        newwidth = (self.mx - self.leftwin_width -
+                    self.column_width * num_of_visible_cols)
+        if newwidth < width:
+            self.rightwin.resize(self.nrows + 1, newwidth)
+            self.rightwin.mvwin(
+                4, self.leftwin_width + self.column_width * num_of_visible_cols
+            )
+            width = newwidth
+
+        c = self.color("white", active)
+        w = self.rightwin.getmaxyx()[1] - 1
+        for y, p in enumerate(range(self.idxpos, self.idxpos + self.nrows)):
+            try:
+                summary = "│ ({0}) {1}".format(
+                    self.callids[self.db[self.idx[p]].sipmsg.callid],
+                    self.db[self.idx[p]].sum.ljust(w)
+                ).ljust(w)
+                self.rightwin.addstr(y, 0, summary, c)
+            except IndexError:
+                pass
+        self.rightwin.refresh()
+
+    @coroutine
+    def draw_msgwin(self):
+        """Draws/resizes the SIP message detail window.
+
+        Note: this is a coroutine so contol is passed back and forth
+        between main event loop and the while loop of this method
+        allowing for parallel message reading and rendering.
+
+        Yields:
+            None: None
+        """
+        def chunk(text, size):
+            return [text[0+i:size+i].strip() for i in range(0, len(text), size)]
+
+        def flatten(ll):
+            return [elem for lst in ll for elem in lst]
+
+        rec = self.db[self.idx[self.idxpos + self.curpos]]
+        headers, _, content = rec.sipmsg.tostring().partition("\r\n\r\n")
+
+        width = self.mx - 8
+        headers = [chunk(lines, width - 2) for lines in headers.split("\n")]
+        content = [chunk(lines, width - 2) for lines in content.split("\n")]
+        nlines = len(flatten(headers)) + (
+            len(flatten(content)) + 1 if any(content) else 0
+        )
+        height = min(nlines + 4, self.my - 8)
+        ypos = self.my // 2 - height // 2
+        xpos = self.mx // 2 - width // 2
+
+        c = self.color("white")
+        win = curses.newwin(height + 1, width + 1, ypos, xpos)
+        win.addstr(0, 0, "┌", c)
+        win.addstr(0, width - 1, "┐", c)
+        win.addstr(height, 0, "└", c)
+        win.addstr(height, width - 1, "┘", c)
+        win.addstr(0, 1, "─" * (width - 2), c)
+        win.addstr(2, 1, "─" * (width - 2), c)
+        win.addstr(height, 1, "─" * (width - 2), c)
+        for i in range(1, height):
+            win.addstr(i, 0, "│", c)
+            win.addstr(i, (width - 1), "│", c)
+        win.addstr(2, 0, "├", c)
+        win.addstr(2, (width - 1), "┤", c)
+        if height - 4 < nlines:
+            win.addstr(height - 1, width // 2, "...", self.color("green") | curses.A_BOLD)
+        win.addstr(1, width // 2 - len(rec.title) // 2 + 4, rec.title, c)
+        win.refresh()
+
+        y = 0
+        top_y = 0
+        chdr = self.color("purple")
+        pad = curses.newpad(nlines, width)
+        for hdrno, header_lines in enumerate(headers):
+            if hdrno == 0:
+                ctext = self.color("red")
+            else:
+                ctext = self.color("white")
+            for chunkno, header_line in enumerate(header_lines):
+                if hdrno == 0:
+                    pad.addstr(y, 0, header_line, ctext)
+                elif chunkno == 0:
+                    hdr, text = header_line.split(" ", 1)
+                    pad.addstr(y, 0, hdr + " ", chdr)
+                    pad.addstr(y, len(hdr) + 1, text, ctext)
+                else:
+                    pad.addstr(y, 0, header_line, ctext)
+                y += 1
+        y += 1
+        ctext = self.color("green")
+        for content_lines in content:
+            for content_line in content_lines:
+                pad.addstr(y, 0, content_line, ctext)
+                y += 1
+        pad.refresh(top_y, 0, ypos + 3, xpos + 1,
+                    ypos + height - 2, xpos + width - 2)
+
+        chstr = (yield)
+        while True:
+            if chstr in ("q", "Q", "KEY_ENTER", "^J", "^["):
+                self.erase_center()
+                break
+            elif chstr in ("f", "F"):
+                curses.ungetch("f")
+                break
+            elif chstr == "KEY_DOWN":
+                if nlines - (height - 4) - top_y > 0:
+                    top_y += 1
+                    pad.refresh(top_y, 0, ypos + 3, xpos + 1,
+                                ypos + height - 2, xpos + width - 2)
+                    if nlines - (height - 4) - top_y == 0:
+                        win.addstr(height - 1, width // 2, "   ", ctext)
+                        win.refresh()
+            elif chstr == "KEY_UP":
+                top_y = top_y - 1 if top_y > 0 else top_y
+                pad.refresh(top_y, 0, ypos + 3, xpos + 1,
+                            ypos + height - 2, xpos + width - 2)
+                if nlines - (height - 4) - top_y > 0:
+                    win.addstr(height - 1, width // 2, "...",
+                               self.color("green") | curses.A_BOLD)
+                    win.refresh()
+            chstr = yield None
+
+    @coroutine
+    def draw_filterwin(self):
+        """Draws the Filter window.
+
+        Note: this is a coroutine so contol is passed back and forth
+        between main event loop and the while loop of this method
+        allowing for parallel message reading and filter manipulation.
+
+        Yields:
+            None
+        """
+        def draw_filter(rv=""):
+            chunks = wrap("".join(chars), 59)
+            color = self.color("green")
+            for i, chunk in izip_longest((0, 1, 2), chunks, fillvalue=" "):
+                win.addstr(10 + i, 14, "{0:<59}".format(chunk), color)
+            win.addstr(9, 14, rv.ljust(59), self.color("red"))
+            x = (len(chars) % 60) + 14 if chars else 14
+            y = (len(chars) // 60) + 10 if chars else 10
+            win.move(y, x)
+
+        box = [
+            "╒═════════════════════════════════════════════════════════════════════════╕",
+            "│                             Display Filters                             │",
+            "│    -a <ACM callid>   Filter messages based on ACM callid.               │",
+            "│    -c <CALL-ID>      Filter on the SIP 'Call-ID' header.                │",
+            "│    -i <IP>           Filter messages based on src/dst IP address.       │",
+            "│    -r <REGEXP>       Filter messages based on regular expression.       │",
+            "│    -ni               Do not display INFO messages.                      │",
+            "│    -nn               Do not display NOTIFY messages.                    │",
+            "│    -no               Do not display OPTIONS messages.                   │",
+            "│                                                                         │",
+            "│ New Filter:                                                             │",
+            "│                                                                         │",
+            "│                                                                         │",
+            "╘═════════════════════════════════════════════════════════════════════════╛",
+        ]
+
+        win, _, _ = self.draw_box(box)
+        chars = []
+        draw_filter()
+        win.refresh()
+
+        rv = ""
+        y, x = 10, 14
+        win.move(y, x)
+        chstr = (yield)
+        while True:
+            if chstr in ("KEY_BACKSPACE", "^H"):
+                chars = chars[:len(chars)-1]
+            elif chstr == "^[":
+                curses.curs_set(0)
+                self.erase_stdscr()
+                break
+            elif chstr in ("KEY_ENTER", "^J"):
+                rv = self.update_filters(chars)
+                if not rv:
+                    curses.curs_set(0)
+                    self.draw_loadwin()
+                    break
+            elif len(chstr) == 1 and len(chars) < 3*59:
+                chars.append(chstr)
+            if chstr != "NONE":
+                draw_filter(rv)
+                win.refresh()
+            chstr = yield None
+
+    @coroutine
+    def draw_gotowin(self):
+        """Draws Goto window.
+
+        Note: this is a coroutine so contol is passed back and forth
+        between main event loop and the while loop of this method
+        allowing for parallel message reading and interaction with user.
+
+        Yields:
+            None
+        """
+        goto = [
+            "╒══════════════════════════════╕",
+            "│ Goto timestamp:              │",
+            "╘══════════════════════════════╛",
+        ]
+        validchars = [str(x) for x in range(0, 10)] + [":", "."]
+        win, xpos, ypos = self.draw_box(goto)
+        win.keypad(1)
+        win.move(1, 18)
+        win.refresh()
+        curses.curs_set(1)
+
+        xpos = 18
+        chars = []
+        chstr = (yield)
+        while True:
+            if chstr in validchars and xpos < 30:
+                chars.append(chstr)
+                xpos += 1
+            elif chstr in ("KEY_BACKSPACE", "^H"):
+                chars = chars[:-1]
+                xpos = xpos - 1 if xpos > 18 else xpos
+            elif chstr in ("Q", "q", "^["):
+                break
+            elif chstr in ("KEY_ENTER", "^J"):
+                self.autoscroll = False
+                hhmmssff = [int(x) for x in re.split("[:.]", "".join(chars))]
+                if len(hhmmssff) == 4:
+                    hhmmssff[3] = hhmmssff[3] * 1000
+                ref = self.db[self.idx[0]].timestamp
+                ts = datetime(ref.year, ref.month, ref.day, *hhmmssff)
+                try:
+                    self.idxpos = next(
+                        i for i, dbidx in enumerate(self.idx)
+                        if self.db[dbidx].timestamp >= ts
+                    )
+                    self.curpos = 0
+                except:
+                    pass
+                break
+
+            if chstr != "NONE":
+                win.addstr(1, 18, "".join(chars).ljust(8), self.color("green"))
+                win.move(1, xpos)
+                win.refresh()
+            chstr = yield None
+        curses.curs_set(0)
+        self.erase_center()
+
+    @coroutine
+    def draw_callswin(self):
+        """Draws the Call Details window.
+
+        Note: this is a coroutine so contol is passed back and forth
+        between main event loop and the while loop of this method
+        allowing for parallel message reading and rendering this window.
+
+        Yields:
+            None
+        """
+        x = 0
+        idx = 0
+        curpos = 0
+        nrows = self.callspad.getmaxyx()[0]
+        timestamp = None
+        autoscroll = True
+        box = [
+            "┌────────┬──────┬──────┬───────────────┬─────┬───────────────┬─────┬─────┬─────┬──────┬──────┬──────┬───────┬───────┬───────┬────────────────────────────────────┐",
+            "│  start │cm cid│cm uid│    localip    │lport│    remoteip   │rport│audio│video│Rating│ mean │remote│ local │ remote│  mean │                 gslid              │",
+            "│        │      │      │               │     │               │     │codec│codec│Factor│jitter│jitter│pktloss│pktloss│rtdelay│                                    │",
+            "├────────┼──────┼──────┼───────────────┼─────┼───────────────┼─────┼─────┼─────┼──────┼──────┼──────┼───────┼───────┼───────┼────────────────────────────────────┤",
+        ]
+        cols = (
+            ("start", 8),
+            ("cmcid", 6),
+            ("cmuid", 6),
+            ("localip", 15),
+            ("localport", 5),
+            ("remoteip", 15),
+            ("remoteport", 5),
+            ("audiocodec", 5),
+            ("videocodec", 5),
+            ("qosrfactor", 6),
+            ("qosmeanjit", 6),
+            ("qosremjit", 6),
+            ("qoslocploss", 7),
+            ("qosremploss", 7),
+            ("qosmeanrtdelay", 7),
+            ("gslid", 36),
+        )
+        sepxposes = (0, 9, 16, 23, 39, 45, 61, 67, 73, 79,
+                     86, 93, 100, 108, 116, 124, 161)
+        f = " ".join("{"+n+":>"+str(w)+"}" for n, w in cols)
+
+        def update_pads():
+            for y, (gslid, v) in enumerate(self.active_sess_cumu[idx:idx+nrows].iteritems()):
+                color = self.color("orange") if gslid in self.active_sess_last else self.color("white")
+                c = color | curses.A_REVERSE if curpos == y else color
+                cmcid, cmuid = self.gslid_to_cmcid_uid(gslid)
+                v.update({"start": v["startts"][11:], "cmcid": cmcid, "cmuid": cmuid})
+                self.callspad.addstr(y, 1, f.format(**v), c)
+                c = self.color("white")
+                for sepxpos in sepxposes:
+                    self.callspad.addstr(y, sepxpos, "│", c)
+            self.callspad.refresh(0, x, 4, 0, self.my - 1, self.mx - 1)
+            self.callstitlepad.refresh(0, x, 0, 0, 3, self.mx - 1)
+
+        self.stdscr.erase()
+        self.stdscr.refresh()
+
+        c = self.color("white")
+        for y, line in enumerate(box):
+            self.callstitlepad.addstr(y, 0, line, c)
+        self.callstitlepad.refresh(0, x, 0, 0, 3, self.mx - 1)
+        self.draw_calls_menuline()
+
+        chstr = (yield)
+        while True:
+            if not timestamp or timestamp < self.ams.last_active_sess_ts:
+                timestamp = self.ams.last_active_sess_ts
+                if autoscroll:
+                    if len(self.active_sess_cumu) > nrows:
+                        idx = len(self.active_sess_cumu) - nrows
+                        curpos = nrows - 1
+                    else:
+                        idx = 0
+                        curpos = len(self.active_sess_cumu) - 1
+                update_pads()
+
+            if chstr in ("D", "d", "^[", "KEY_RESIZE"):
+                self.stdscr.erase()
+                break
+            elif chstr in ("C", "c"):
+                self.ch_c()
+                self.callspad.refresh(0, x, 4, 0, self.my - 1, self.mx - 1)
+            elif chstr == "KEY_DOWN":
+                if curpos < nrows - 1 and curpos < len(self.active_sess_cumu) - 1:
+                    curpos += 1
+                    update_pads()
+                elif len(self.active_sess_cumu) > nrows + idx:
+                    idx += 1
+                    update_pads()
+                if len(self.active_sess_cumu) - 1 == curpos + idx:
+                    autoscroll = True
+            elif chstr == "KEY_NPAGE":
+                if len(self.active_sess_cumu) > idx + 2 * nrows:
+                    idx += nrows
+                    curpos = 0
+                elif len(self.active_sess_cumu) <= nrows:
+                    autoscroll = True
+                    curpos = len(self.active_sess_cumu) - 1
+                else:
+                    idx = len(self.active_sess_cumu) - nrows
+                    autoscroll = True
+                    curpos = nrows - 1
+                update_pads()
+            elif chstr == "KEY_UP":
+                if curpos > 0:
+                    curpos -= 1
+                elif idx > 0:
+                    idx -= 1
+                autoscroll = False
+                update_pads()
+            elif chstr == "KEY_PPAGE":
+                if idx < nrows:
+                    idx = 0
+                    curpos = 0
+                else:
+                    idx -= nrows
+                    curpos = nrows - 1
+                autoscroll = False
+                update_pads()
+            elif chstr == "KEY_RIGHT":
+                if x + self.mx < self.callspad.getmaxyx()[1] - 3:
+                    x += 1
+                    update_pads()
+            elif chstr == "KEY_LEFT":
+                if x > 0:
+                    x -= 1
+                    update_pads()
+            elif chstr in ("KEY_ENTER", "^J"):
+                try:
+                    callid = self.gslid_to_callid[self.active_sess_cumu[idx+curpos][0]]
+                    rv = self.update_filters("-c {0}".format(callid))
+                    if not rv:
+                        curses.curs_set(0)
+                        self.active = self.draw_loadwin()
+                        break
+                except:
+                    pass
+            chstr = yield None
+
+    @coroutine
+    def draw_quitwin(self):
+        """Draws Quit window.
+
+        Note: this is a coroutine so contol is passed back and forth
+        between main event loop and the while loop of this method
+        allowing for parallel message reading and interaction with user.
+
+        Yields:
+            None
+        """
+        quit = [
+            "╒══════════════════════════════════════╕",
+            "│ Debug logging is still enabled and   │",
+            "│ will remain enabled if you quit now. │",
+            "│                                      │",
+            "│ Are you sure you want to quit (Y/N)? │",
+            "╘══════════════════════════════════════╛",
+        ]
+        win, _, _ = self.draw_box(quit)
+        win.keypad(1)
+        chstr = (yield)
+        while True:
+            if chstr in ("Y", "y"):
+                self.breakout = True
+                break
+            elif chstr in ("N", "n"):
+                win.erase()
+                win.refresh()
+                break
+            chstr = yield None
+
+    def draw_resizewin(self):
+        """Draws Resize window to force user to enlarge window."""
+        minsize = "{0:>2} x {1:>3}".format(self.min_height, self.min_width)
+        current = "{0:>2} x {1:>3}".format(self.my, self.mx)
+        enlarge = [
+            "╒════ Enlarge Window ════╕",
+            "│ Minimum size: {0} │".format(minsize),
+            "│ Current size: {0} │".format(current),
+            "╘════════════════════════╛",
+        ]
+        win, _, _ = self.draw_box(enlarge)
+        ch = None
+        while ch != curses.KEY_RESIZE:
+            ch = win.getch()
+            if ch in ("q", "Q"):
+                self.breakout = 1
+                break
+        self.stdscr.erase()
+        self.stdscr.refresh()
+
+    def draw_loadwin(self):
+        """Drawns Loading window when logfiles are being loaded."""
+        loading = [
+            "╒═════════╕",
+            "│ Loading │",
+            "╘═════════╛",
+        ]
+        nothing = [
+            "╒════════════════════╕",
+            "│ Nothing to display │",
+            "╘════════════════════╛",
+        ]
+        self.erase_stdscr()
+        self.draw_box(loading)
+
+        if self.logfiles:
+            self.loadlogs()
+            self.logfiles = None
+
+        self.update_idx()
+        if not self.idx:
+            if not self.capture_active:
+                self.erase_stdscr()
+                self.draw_box(nothing)
+            else:
+                self.draw_capturewin()
+                self.idxpos = 0
+                self.curpos = -1
+        else:
+            self.erase_center()
+            self.idxpos = 0
+            self.curpos = 0
+            self.autoscroll = False
+
+    def draw_capturewin(self):
+        """Drawns Capturing window."""
+        capturing = [
+            "╒══════════════╕",
+            "│ Capturing... │",
+            "╘══════════════╛",
+        ]
+        self.erase_stdscr()
+        self.draw_box(capturing)
+
+    def draw_filterline(self):
+        """Draws Display filter line."""
+        text = "Display filter: {0}".format(self.filterstr)
+        c = self.color("white") | curses.A_REVERSE
+        self.stdscr.addstr(self.my - 2, 0, text.ljust(self.mx), c)
+        self.stdscr.refresh()
+
+    def draw_calls_menuline(self):
+        """Draws the menu line for the call details window."""
+        d = {"c": "c=Clear", "d": "d=Return", "e": "ENTER=Filtered Msgs"}
+        menu = "{c}   {d}   {e}".format(**d)
+        c = self.color("border") | curses.A_REVERSE
+        x = self.mx // 2 - len(menu) // 2
+        self.stdscr.addstr(self.my - 1, 0, " " * (self.mx - 1), c)
+        self.stdscr.addstr(self.my - 1, x, menu, c)
+        if self.capture_active:
+            text = "Running"
+            c = self.colors["gray"] | curses.A_REVERSE
+        else:
+            text = "Stopped"
+            c = self.colors["gray"] | curses.A_REVERSE
+        self.stdscr.addstr(self.my - 1, 0, text, c)
+        self.stdscr.refresh()
+
+    def draw_menuwin(self):
+        """Draws the menu line for main screen."""
+        d = {"q": "q=Quit", "c": "c=Clear", "f": "f=Filters"}
+        d["s"] = "s=Start" if not self.capture_active else "s=Stop"
+        d["e"] = "" if not self.idx else "ENTER=Details"
+        d["g"] = "" if not self.idx else "g=Goto"
+        d["d"] = "" if not self.idx else "d=Calls"
+        menu = "{s:7}  {q}  {c}  {f}  {e:13}  {g:6}  {d:7}".format(**d)
+
+        c = self.color("border") | curses.A_REVERSE
+        x = self.mx // 2 - len(menu) // 2 + 3
+        self.menuwin.addstr(0, 0, " " * self.mx, c)
+        self.menuwin.addstr(0, x, menu, c)
+
+        if self.capture_active:
+            text = "Running"
+            c = self.colors["green"] | curses.A_REVERSE
+        else:
+            text = "Stopped"
+            c = self.colors["red"] | curses.A_REVERSE
+        self.menuwin.addstr(0, 0, text, c)
+        self.menuwin.refresh()
+
+    def draw_box(self, box, active=True):
+        """Draws given box in the middle of the main screen.
+
+        Args:
+            box (list): list of strings of a box.
+            active (bool, optional): True if this part of the screen is
+                active (on the top) or False otherwise.
+
+        Returns:
+            obj, int, int: curses window, y, x coordinates of start of window.
+        """
+        y = self.my // 2 - len(box) // 2 - 1
+        x = self.mx // 2 - len(box[0].decode("utf-8")) // 2
+        win = curses.newwin(len(box), len(box[0].decode("utf-8"))+1, y, x)
+        c = self.color("white", active)
+        for i, row in enumerate(box):
+            win.addstr(i, 0, row, c)
+        win.refresh()
+        return win, y, x
+
+    def ch_c(self):
+        """Processes C/c key stroke."""
+        del self.db[:]
+        del self.idx[:]
+        self.hosts = ["AMS"]
+        self.active_sess_cumu.clear()
+        self.active_sess_last.clear()
+        self.gslid_to_avcmid.clear()
+        self.gslid_to_callid.clear()
+        self.update_title()
+        self.callspad.erase()
+        self.dbpos = 0
+        self.idxpos = 0
+        self.curpos = -1
+        self.autoscroll = True
+        if self.active == self.stdscr:
+            self.stdscr.erase()
+            self.draw_capturewin()
+
+    def ch_d(self):
+        """Processes D/d key stroke."""
+        self.stdscr.erase()
+        self.active = self.draw_callswin()
+
+    def ch_f(self):
+        """Processes F/f key stroke."""
+        self.erase_center()
+        self.refreshall(active=False)
+        self.active = self.draw_filterwin()
+
+    def ch_g(self):
+        """Processes G/g key stroke."""
+        if not self.idx:
+            return
+        self.refreshall(active=False)
+        self.active = self.draw_gotowin()
+
+    def ch_s(self):
+        """Processes S/s key stroke."""
+        if self.capture_active:
+            if self.ams.sip_capture_stop():
+                self.capture_active = 0
+        else:
+            self.siplogreader = self.SIPLogReader()
+            if self.ams.sip_capture_start():
+                self.capture_active = 1
+                if not self.idx:
+                    self.draw_capturewin()
+        self.draw_menuwin()
+
+    def ch_right(self):
+        """Processes RIGHT arrow key stroke."""
+        if not self.idx:
+            return
+        if self.xpos // self.column_width + self.maxcols < len(self.hosts) - 1:
+            self.xpos += self.column_width
+            self.refresh_ladderpad()
+            self.refresh_hostpad()
+
+    def ch_left(self):
+        """Processes LEFT arrow key stroke."""
+        if not self.idx:
+            return
+        if self.xpos - self.column_width >= 0:
+            self.xpos -= self.column_width
+            self.refresh_ladderpad()
+            self.refresh_hostpad()
+
+    def ch_up(self):
+        """Processes UP arrow key stroke."""
+        if not self.idx:
+            return
+        if self.curpos > 0:
+            self.curpos -= 1
+            self.draw_ladderpad()
+        elif self.idxpos > 0:
+            self.idxpos -= 1
+            self.refreshall()
+        self.autoscroll = False
+
+    def ch_ppage(self):
+        """Processes PGUP key stroke."""
+        if not self.idx:
+            return
+        if self.idxpos < self.nrows:
+            self.idxpos = 0
+            self.curpos = 0
+        else:
+            self.idxpos -= self.nrows
+            self.curpos = self.nrows - 1
+        self.autoscroll = False
+        self.refreshall()
+
+    def ch_down(self):
+        """Processes DOWN arrow key stroke."""
+        if not self.idx:
+            return
+        if self.curpos < self.nrows - 1:
+            if len(self.idx) - 1 > self.curpos + self.idxpos:
+                self.curpos += 1
+                self.draw_ladderpad()
+        else:
+            if len(self.idx) > self.idxpos + self.nrows:
+                self.idxpos += 1
+                self.refreshall()
+        if len(self.idx) - 1 == self.curpos + self.idxpos:
+            self.autoscroll = True
+
+    def ch_npage(self):
+        """Processes PGDOWN key stroke."""
+        if not self.idx:
+            return
+        if len(self.idx) > self.idxpos + 2 * self.nrows:
+            self.idxpos += self.nrows
+            self.curpos = 0
+        elif len(self.idx) <= self.nrows:
+            self.autoscroll = True
+            self.curpos = len(self.idx) - 1
+        else:
+            self.idxpos = len(self.idx) - self.nrows
+            self.autoscroll = True
+            self.curpos = self.nrows - 1
+        self.refreshall()
+
+    def ch_home(self):
+        """Processes HOME key stroke."""
+        if not self.idx:
+            return
+        self.curpos = 0 if self.db else self.cursor
+        self.idxpos = 0
+        self.autoscroll = False
+        self.refreshall()
+
+    def ch_end(self):
+        """Processes END key stroke."""
+        if not self.idx:
+            return
+        if len(self.idx) > self.nrows:
+            self.idxpos = len(self.idx) - self.nrows
+            self.curpos = self.nrows - 1
+        else:
+            self.idxpos = 0
+            self.curpos = len(self.idx) - 1
+        self.autoscroll = True
+        self.refreshall()
+
+    def ch_resize(self):
+        """Processes curses KEY_RESIZE stroke."""
+        self.main(self.stdscr)
+
+    def ch_enter(self):
+        """Processes ENTER key stroke."""
+        if not self.idx:
+            return
+        self.refreshall(active=False)
+        self.active = self.draw_msgwin()
+
+    def ch_q(self):
+        """Processes Q/q key stroke."""
+        self.refreshall(active=False)
+        if self.capture_active:
+            self.active = self.draw_quitwin()
+        else:
+            self.breakout = True
+
+    def refreshall(self, active=True):
+        """Redraws all windows/pads."""
+        self.draw_top(active)
+        self.draw_hostpad(active)
+        self.draw_leftwin(active)
+        self.draw_ladderpad(active)
+        self.draw_rightwin(active)
+        self.draw_filterline()
+        self.draw_menuwin()
+        self.update_title()
+
+    def erase_center(self):
+        """Erases the center area."""
+        self.leftwin.erase()
+        self.ladderpad.erase()
+        self.rightwin.erase()
+        self.leftwin.refresh()
+        self.refresh_ladderpad()
+        self.rightwin.refresh()
+
+    def erase_stdscr(self):
+        """Erases stdscr and redraws filter and menu lines."""
+        self.stdscr.erase()
+        self.stdscr.refresh()
+        self.draw_filterline()
+        self.draw_menuwin()
+
+    def loadlogs(self, logfiles=None):
+        """Loads SIP messages from logfiles.
+
+        Args:
+            logfiles (list, optional): sip log files. Defaults to None.
+
+        Returns:
+            None
+        """
+        if not logfiles:
+            logfiles = self.logfiles
+        reader = SIPLogReader(logfiles=logfiles)
+        for msg in reader:
+            self.update_db(msg)
+
+    def update_title(self):
+        """Updates terminal status line."""
+        if len(self.db) == self.maxlen:
+            warn = "MAX NUMBER ({0}) OF MSGS IS REACHED!".format(self.maxlen)
+        else:
+            warn = "".ljust(40)
+        l = [self.ams.name, "Ver:{0}".format(self.ams.version)]
+        l.append("Num of Messages: {0:>5}".format(len(self.db)))
+        l.append("Active Sessions: {0:>4}".format(len(self.active_sess_last)))
+        l.append("MemUsage:{0:>4}MB".format(self.maxrss))
+        l.append("{0}".format(warn))
+        sys.stdout.write("\x1b]2;%s\x07" % "      ".join(l).ljust(self.mx * 3))
+        sys.stdout.flush()
+
+    def update_filters(self, chars):
+        """Updates filters.
+
+        Args:
+            chars (list): list of characters.
+
+        Returns:
+            None
+        """
+        rv = "Invalid filter, try again."
+        try:
+            args, err = parse_filter("".join(chars))
+            if err:
+                return rv
+        except:
+            return rv
+
+        self.filterstr = "".join(chars)
+        if not self.filterstr:
+            self.filter_cmcid = set()
+            self.filter_callid = set()
+            self.filter_ip = set()
+            self.filter_method = set()
+            self.filter_regex = re.compile(r"")
+            return
+
+        self.filter_cmcid = set(x for x in (args.get("a", []) or []) if x)
+        self.filter_callid = set(x for x in (args.get("c", []) or []) if x)
+        self.filter_ip = set(x for x in (args.get("i", []) or []) if x)
+        self.filter_method = set(x for x in (
+            {"o": "OPTIONS", "n": "NOTIFY", "i": "INFO"}.get(x, "")
+            for x in (args.get("n", []) or []) if x) if x
+        )
+        self.filter_regex = re.compile(
+            "|".join(x for x in (args.get("r", []) or []) if x)
+        )
+
+    def update_db(self, msg):
+        """Updates db datastore with msg if allowed by filters.
+
+        Args:
+            msg (tuple): tuple returned by SIPLogReader or None.
+
+        Returns:
+            None
+        """
+        rec = SIPRecord(*msg)
+        self.db.append(rec)
+
+        if msg[2] not in self.hosts:
+            if len(self.hosts) == 1:
+                self.hosts.insert(0, msg[2])
+            else:
+                self.hosts.append(msg[2])
+            self.update_hostpad_smaxcol()
+            self.update_ladderpad_smaxcol()
+
+        if rec.sipmsg.callid not in self.callids:
+            self.callids[rec.sipmsg.callid] = len(self.callids) + 1
+
+        if rec.sipmsg.msgtype_method() == ("200", "INVITE"):
+            self.gslid_to_avcmid[rec.sipmsg.gslid] = rec.sipmsg.av_cm_id
+            self.gslid_to_callid[rec.sipmsg.gslid] = rec.sipmsg.callid
+
+        if self.is_rec_idxable(rec):
+            if not self.idx:
+                self.erase_center()
+            self.idx.append(len(self.db) - 1)
+            if len(self.idx) <= self.nrows:
+                if self.autoscroll:
+                    self.curpos += 1
+                self.refresh = True
+            elif self.autoscroll:
+                self.idxpos += 1
+                self.refresh = True
+
+    def update_idx(self):
+        """Updates display filter lists based on current filters."""
+        self.idx = [i for i, rec in enumerate(self.db)
+                    if self.is_rec_idxable(rec)]
+
+    def update_hostpad_smaxcol(self):
+        """Calculates and updates hostpad_smaxcol which stores the x
+        coordinate of the right corner of hostpad."""
+        num_of_visible_hosts = min(len(self.hosts), self.maxcols + 1)
+        self.hostpad_smaxcol = (
+            num_of_visible_hosts * self.column_width + self.leftwin_width
+        )
+
+    def update_ladderpad_smaxcol(self):
+        """Calculates and updates ladderpad_smaxcol which stores the x
+        coordinate of the right corner of ladderpad."""
+        num_of_visible_cols = min(len(self.hosts) - 1, self.maxcols)
+        self.ladderpad_smaxcol = (
+            num_of_visible_cols * self.column_width + self.leftwin_width
+        )
+
+    def is_rec_idxable(self, rec):
+        """Returns True if rec (SIP record) can be displayed.
+
+        Args:
+            rec (SIPRecord): SIPRecord instance.
+
+        Returns:
+            bool: True if SIP Record can be displayed, False otherwise.
+        """
+        if self.filter_cmcid and rec.cmcid not in self.filter_cmcid:
+            return False
+        if self.filter_callid and rec.sipmsg.callid not in self.filter_callid:
+            return False
+        if self.filter_ip and rec.sipmsg.host not in self.filter_ip:
+            return False
+        if self.filter_method and rec.sipmsg.method in self.filter_method:
+            return False
+        if self.filter_regex and not self.filter_regex.search(rec.sipmsg._str):
+            return False
+        return True
+
+    def _is_active_sess_update_due(self):
+        """bool: Returns True if active_sess query is due."""
+        diff = datetime.now() - self.ams.last_active_sess_ts
+        return diff > timedelta(seconds=self.active_sess_cumu_update_secs)
+
+    def gslid_to_cmcid_uid(self, gslid):
+        """Returns ACM call id and uid of the given gslid.
+
+        Args:
+            gslid (str): x-nt-gslid header content.
+
+        Returns:
+            tuple(str, str): CM callid, CM uid.
+        """
+        av_cm_id = self.gslid_to_avcmid.get(gslid, None)
+        if not av_cm_id:
+            return "", ""
+        elif "igc" in av_cm_id:
+            return "igc", "igc"
+        cmcid, _, uid = av_cm_id.split("-")[1:4]
+        return cmcid, uid
+
+    def color(self, k, active=True):
+        """Returns the color of k from colors.
+
+        Args:
+            k (str): key from "colors" dictionary.
+            active (bool, optional): True of caller's window is active.
+                Defaults to True.
+
+        Returns:
+            obj: curses color object
+        """
+        if not active:
+            return self.colors["gray"]
+        elif self.skin_mono:
+            return self.colors["white"]
+        if isinstance(k, int):
+            return curses.color_pair(self.color_zoo[k])
+        return self.colors.get(k, self.colors["white"])
+
+    def exit(self):
+        """Performs clean-up before exit."""
+        curses.endwin()
+        os.system("clear")
+
+    @staticmethod
+    def memory_usage_resource():
+        """int: Returns the memory usage of this tool in MB."""
+        return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.)
+
+
+##############################################################################
+#                                  FUNCTIONS                                 #
+##############################################################################
+
+
+def initterm():
+    """Initializes the terminal."""
+    os.environ["TERM"] = "screen-256color"
+    locale.setlocale(locale.LC_ALL, "")
+
+
+def restoreterm():
+    """Restores the initial terminal settings."""
+    os.environ["TERM"] = TERM
+    sys.stdout.write("\x1b]2;%s\x07" % node().ljust(120))
+    sys.stdout.flush()
+
+
+def is_already_running():
+    """bool: Returns True if there is already another process
+    running this file.
+    """
+    try:
+        fcntl.flock(selffd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except IOError:
+        return True
+    return False
+
+
+def is_user_root():
+    """bool: Returns True if user is 'root'."""
+    return os.getuid() == 0
+
+
+def main():
+    global winmgr
+    parser = OptionParser(usage='%prog [<options>] [<sip.txt logfiles>]',
+                          description=HELP.format(VERSION))
+    parser.add_option('-n', action='store', default=10000, dest='maxlen',
+                      metavar='<num>', help='number of SIP messages retained in memory,\
+                      default 10000, maximum 20000.')
+    parser.add_option('-i', action='store', default=3, dest='active_sess_update_secs',
+                      metavar='<secs>', help='active sessions refresh interval,\n\
+                      default 3secs, minimum 2secs')
+    parser.add_option('--debug', action='store', default=False, dest='debug',
+                      help=SUPPRESS_HELP)
+    opts, args = parser.parse_args()
+
+    opts.maxlen = min(int(opts.maxlen), MAXLEN)
+    opts.active_sess_update_secs = max(int(opts.active_sess_update_secs),
+                                       MIN_ACTiVE_SESS_UPDATE_SECS)
+
+    if args and os.path.exists(args[0]):
+        opts.logfiles = args
+    else:
+        opts.logfiles = None
+
+    winmgr = Winmgr(
+        maxlen=opts.maxlen,
+        logfiles=opts.logfiles,
+        active_sess_update_secs=opts.active_sess_update_secs,
+        debug=opts.debug,
+    )
+
+    if opts.debug:
+        logging.basicConfig(filename=DEBUG_LOG, level=logging.DEBUG)
+
+    curses.wrapper(winmgr.main)
+
+
+##############################################################################
+#                                    THE END                                 #
+##############################################################################
+
+if __name__ == "__main__":
+    selffd = open(os.path.realpath(__file__), "r")
+    if is_already_running():
+        print("ERROR: {0} is already running.".format(
+            os.path.basename(sys.argv[0]))
+        )
+        sys.exit(1)
+    if not is_user_root():
+        print("ERROR: only 'root' can run this tool.")
+        sys.exit(2)
+
+    try:
+        initterm()
+        main()
+    except KeyboardInterrupt:
+        winmgr.exit()
+    finally:
+        restoreterm()
