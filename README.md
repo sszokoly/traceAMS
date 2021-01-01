@@ -16,7 +16,7 @@ This tool is aiming at addressing the aforementioned problem in AMS by:
 
 - enabling SIP debug logging from Linux shell
 - parsing and retaining 10000 SIP messages in memory
-- visualizing the captured messages in a ladder diagram with a brief summary
+- visualizing the captured messages in a ladder diagram with a brief summary and full message details
 - querying the "active sessions" at regular intervals (every 3secs by default)
 - maintaining and displaying the obtained "active sessions" with their corresponding QoS metrics
 
