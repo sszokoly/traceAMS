@@ -1524,12 +1524,13 @@ class SlicableODict(OrderedDict):
 class Winmgr(object):
     """TUI interface manager using the curses library."""
     def __init__(self, maxlen=10000, logfiles=None, active_sess_update_secs=3,
-                 debug=False, skin_mono=False):
+                 dbname=None, dbuser=None, dbpass=None, debug=False,
+                 skin_mono=False):
         self.maxlen = maxlen
         self.logfiles = logfiles
         self.active_sess_cumu_update_secs = active_sess_update_secs
         self.debug = debug
-        self.ams = AMS()
+        self.ams = AMS(dbname, dbuser, dbpass)
         self.SIPLogReader = SIPLogReader
         self.capture_active = self.ams.is_sip_capture_active()
         self.siplogreader = SIPLogReader() if self.capture_active else None
@@ -2443,8 +2444,9 @@ class Winmgr(object):
         self.curpos = -1
         self.autoscroll = True
         if self.active == self.stdscr:
-            self.stdscr.erase()
-            self.draw_capturewin()
+            self.erase_stdscr()
+            if self.capture_active:
+                self.draw_capturewin()
 
     def ch_d(self):
         """Processes D/d key stroke."""
@@ -2864,6 +2866,12 @@ def main():
     parser.add_option('-i', action='store', default=3, dest='active_sess_update_secs',
                       metavar='<secs>', help='active sessions refresh interval,\n\
                       default 3secs, minimum 2secs')
+    parser.add_option('--dbname', action='store', default=None, dest='dbname',
+                      help=SUPPRESS_HELP)
+    parser.add_option('--dbuser', action='store', default=None, dest='dbuser',
+                      help=SUPPRESS_HELP)
+    parser.add_option('--dbpass', action='store', default=None, dest='dbpass',
+                      help=SUPPRESS_HELP)
     parser.add_option('--debug', action='store', default=False, dest='debug',
                       help=SUPPRESS_HELP)
     opts, args = parser.parse_args()
@@ -2881,6 +2889,9 @@ def main():
         maxlen=opts.maxlen,
         logfiles=opts.logfiles,
         active_sess_update_secs=opts.active_sess_update_secs,
+        dbname=opts.dbname,
+        dbuser=opts.dbuser,
+        dbpass=opts.dbpass,
         debug=opts.debug,
     )
 
